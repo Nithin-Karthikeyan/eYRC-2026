@@ -34,7 +34,9 @@ package_name = 'algorithms'
 SCRIPTS = [
     # Your nodes go here, for example:
     'scripts/task1b/task1B.py',
-    'scripts/task1c/task1C.py'
+    'scripts/task1c/task1C.py',
+    'scripts/task2a/task2A_perception.py',
+    'scripts/task2a/task2A_manipulation.py',
 ]
 
 setup(
