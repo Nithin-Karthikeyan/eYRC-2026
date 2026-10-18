@@ -19,7 +19,7 @@
 
 # Team ID:          1198
 # Author List:      Nithin
-# Filename:         arm_waypoints.py
+# Filename:         task2A_manipulation.py
 # Functions:
 #                   [ Comma separated list of functions in this file ]
 # Nodes:            Add your publishing and subscribing node
@@ -39,6 +39,8 @@ from controller_manager_msgs.srv import SwitchController
 from geometry_msgs.msg import PoseStamped, TwistStamped
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Int32
+import re # needed to parse ore data from tf buffer and assign numbers to each ore type
+import yaml # Convert the data from tf buffer into yaml format to parse using re
 
 
 ##################### TASK CONSTANTS #######################
@@ -46,13 +48,15 @@ from std_msgs.msg import Int32
 # Tool positions in base_link, in metres, in the order they must be reached. The tool
 # stops at each one and holds it for at least two seconds. Copy the signs as they are:
 # base_link is the UR7e's own frame, not the Gazebo world's.
-waypoints = [
-    (-0.4085, -0.5379, 0.1967),   # 1
-    (-0.8000, -0.0005, 0.3967),   # 2
-    (-0.7430,  0.5280, 0.1967),   # 3
-    (-0.4097,  0.5280, 0.1967),   # 4
-    (-0.0763,  0.5280, 0.1967),   # 5
-]
+
+#* Pack this since for 2A the waypoints are the ore centers from base link given by perception node
+# waypoints = [
+#     (-0.4085, -0.5379, 0.1967),   # 1
+#     (-0.8000, -0.0005, 0.3967),   # 2
+#     (-0.7430,  0.5280, 0.1967),   # 3
+#     (-0.4097,  0.5280, 0.1967),   # 4
+#     (-0.0763,  0.5280, 0.1967),   # 5
+# ]
 
 # The two command interfaces. Only ONE is active at a time; messages to the other are
 # accepted and ignored.
@@ -139,7 +143,7 @@ class arm_waypoints(Node):
         self.zero_vel_lin = [0.0]*3
         self.zero_vel_ang = [0.0]*3
 
-        self.unfold_target = [0.0, -1.20, -1.60, -1.90, 1.57, 1.57] # Sets the unfold target angles for each joint
+        self.home_angles = [-1.57, -1.57, -1.57, -1.57, 1.57, 1.57] # Sets the unfold target angles for each joint
         self.unfolded = False # Check if the arm is unfolded before moving using twist messages
 
         # Cartesian PID state (XYZ position error -> XYZ linear velocity)
@@ -149,7 +153,7 @@ class arm_waypoints(Node):
 
         # Error bookkeeping. Each entry stores the MAX TCP position error seen during
         # the successful 2-second hold at that waypoint.
-        self.errors = [None] * len(waypoints)
+        # self.errors = [None] * len(waypoints)
         self.hold_max_error = None
         self.hold_start = None
         self.hold_duration = 2.0
@@ -163,6 +167,14 @@ class arm_waypoints(Node):
         self.integral_limit = 0.5  # <-- ADDED TO FIX UNDEFINED VARIABLE
         self.joint_kp = 2.0
         self.wp_tol = 0.03
+
+        # State machine
+        #* Valid states = ['HOME', 'SWITCH_TO_TWIST', 'WAIT_FOR_ORE', 'MOVE_ABOVE_ORE', 'DESCEND_TO_ORE', 'MAGNET_ON', 'LIFT_ORE', 'VERIFY_PICK', 'MOVE_ABOVE_DROP', 'DESCEND_TO_DROP', 'MAGNET_OFF', 'RETREAT', 'NEXT_ORE', 'RECOVER_STOP', 'DONE']
+        self.state = 'HOME' # Start the node by moving arm to HOME position. 
+
+        self.current_ore = None
+        self.current_ore_position = None # Lock this once ore transform is done to make sure arm moving doesn't mean the position of ore isnt readjusted
+        self.processed_ores = set()
 
         ############################################
     
@@ -318,8 +330,9 @@ class arm_waypoints(Node):
             else:
                 self.get_logger().error(f"Switch to {self.target_controller} Failed. Active controller is {self.active_controller}")
 
-        # 3. Check if arm is unfolded first:
-        if self.unfolded is False:
+        # Implement the state machine:
+        #! state = HOME
+        if self.state == "HOME":
             # 3.1 Check if controller is joint
             if self.active_controller != joint_controller:
                 self.publish_twist(self.zero_vel_lin, self.zero_vel_ang)
@@ -329,174 +342,190 @@ class arm_waypoints(Node):
                 return 
 
             joint_Kp = self.joint_kp
-            joint_errors = [target - current for target, current in zip(self.unfold_target, self.joint_angles)]
+            joint_errors = [target - current for target, current in zip(self.home_angles, self.joint_angles)]
             joint_velocity = [max(-self.joint_vel_cap, min(error * joint_Kp, self.joint_vel_cap)) for error in joint_errors]
             self.publish_joint_jog(joint_velocity)
             joint_tolerance = 0.02
-
-            self.get_logger().info(f"Joint Velocities: {joint_velocity}")
-            self.get_logger().info(f"Joint Errors: {joint_errors}")
+            self.get_logger().info(f"Joint angles: {[round(q, 3) for q in self.joint_angles]}")
             if all(abs(e) < joint_tolerance for e in joint_errors):
                 self.publish_joint_jog([0.0] * 6)
-                self.unfolded = True
+                self.state = "SWITCH_TO_TWIST"
                 return
 
-            
-        # 4. If unfolded is true, then send twist commands
-        else:
-            # Check if Active controller is twist, if not change it:
+        elif self.state == "SWITCH_TO_TWIST":
             if self.active_controller != twist_controller:
-                self.publish_twist(self.zero_vel_lin, self.zero_vel_ang)
+                self.publish_joint_jog([0] * 6)
                 self.target_controller = twist_controller
                 self.switch_controller(self.target_controller)
                 self.get_logger().info(f"Switch to {self.target_controller} Initiated...")
-                return 
-
-            # 5. Put all way point reached logic here, and increment self.curr_wp when reached.
-            if self.curr_wp >= len(waypoints):
-                self.publish_twist(self.zero_vel_lin, self.zero_vel_ang)
-
-                if not self.summary_logged:
-                    self.get_logger().info("All waypoints reached.")
-                    summary = " | ".join(
-                        f"WP{i + 1}: {err:.5f} m ({err * 1000.0:.1f} mm)"
-                        if err is not None else f"WP{i + 1}: not recorded"
-                        for i, err in enumerate(self.errors)
-                    )
-                    self.get_logger().info(f"Max error during each successful 2 s hold -> {summary}")
-                    self.summary_logged = True
                 return
-            # get current pose
-            curr_pose = self.tcp_pose.position
-            target_pose = waypoints[self.curr_wp]
-            # Cartesian position error in base_link
-            pos_error = [
-                target_pose[0] - curr_pose.x,
-                target_pose[1] - curr_pose.y,
-                target_pose[2] - curr_pose.z,
-            ]
-            error = math.sqrt(sum(e * e for e in pos_error))
-            waypoint_tolerance = self.wp_tol
+            self.get_logger().info(f"{self.target_controller} Active. Moving to next State")
+            self.state = "WAIT_FOR_ORE"
 
-            self.debug_counter += 1
-            if self.debug_counter % 10 == 0:  # ~2 Hz at a 20 Hz control loop
-                self.get_logger().info(
-                    f"WP {self.curr_wp + 1} error: {error:.5f} m ({error * 1000.0:.1f} mm) | "
-                    f"ex={pos_error[0]:+.4f}, ey={pos_error[1]:+.4f}, ez={pos_error[2]:+.4f}"
-                )
+        elif self.state == "WAIT_FOR_ORE":
+            self.get_logger().info(f"in {self.state}")
 
-            if error < waypoint_tolerance:
-                self.get_logger().info(f"Waypoint {self.curr_wp + 1} reached.")
-                # Keep explicitly commanding zero velocity while holding
-                self.publish_twist(
-                    self.zero_vel_lin,
-                    self.zero_vel_ang
-                )
 
-                # Start hold timer when waypoint is first reached
-                if self.hold_start is None:
-                    self.hold_start = self.get_clock().now()
-                    self.hold_max_error = error
-                    self.reset_pid()
 
-                    self.get_logger().info(
-                        f"Waypoint {self.curr_wp + 1} reached at {error * 1000.0:.1f} mm error. Starting 2 second hold..."
-                    )
+        
 
-                    return
 
-                # Calculate how long we have been holding
-                elapsed = (
-                    self.get_clock().now() - self.hold_start
-                ).nanoseconds / 1e9
+            
+        # # 4. If unfolded is true, then send twist commands
+        # else:
+        #     # Check if Active controller is twist, if not change it:
+        #     if self.active_controller != twist_controller:
+        #         self.publish_twist(self.zero_vel_lin, self.zero_vel_ang)
+        #         self.target_controller = twist_controller
+        #         self.switch_controller(self.target_controller)
+        #         self.get_logger().info(f"Switch to {self.target_controller} Initiated...")
+        #         return 
 
-                self.hold_max_error = max(self.hold_max_error, error)
+        #     # 5. Put all way point reached logic here, and increment self.curr_wp when reached.
+        #     if self.curr_wp >= len(waypoints):
+        #         self.publish_twist(self.zero_vel_lin, self.zero_vel_ang)
 
-                if self.debug_counter % 10 == 0:
-                    self.get_logger().info(
-                        f"Holding WP {self.curr_wp + 1}: {elapsed:.2f} s | "
-                        f"current error={error * 1000.0:.1f} mm | "
-                        f"max hold error={self.hold_max_error * 1000.0:.1f} mm"
-                    )
+        #         if not self.summary_logged:
+        #             self.get_logger().info("All waypoints reached.")
+        #             summary = " | ".join(
+        #                 f"WP{i + 1}: {err:.5f} m ({err * 1000.0:.1f} mm)"
+        #                 if err is not None else f"WP{i + 1}: not recorded"
+        #                 for i, err in enumerate(self.errors)
+        #             )
+        #             self.get_logger().info(f"Max error during each successful 2 s hold -> {summary}")
+        #             self.summary_logged = True
+        #         return
+        #     # get current pose
+        #     curr_pose = self.tcp_pose.position
+        #     target_pose = waypoints[self.curr_wp]
+        #     # Cartesian position error in base_link
+        #     pos_error = [
+        #         target_pose[0] - curr_pose.x,
+        #         target_pose[1] - curr_pose.y,
+        #         target_pose[2] - curr_pose.z,
+        #     ]
+        #     error = math.sqrt(sum(e * e for e in pos_error))
+        #     waypoint_tolerance = self.wp_tol
 
-                # Hold complete
-                if elapsed >= self.hold_duration:
+        #     self.debug_counter += 1
+        #     if self.debug_counter % 10 == 0:  # ~2 Hz at a 20 Hz control loop
+        #         self.get_logger().info(
+        #             f"WP {self.curr_wp + 1} error: {error:.5f} m ({error * 1000.0:.1f} mm) | "
+        #             f"ex={pos_error[0]:+.4f}, ey={pos_error[1]:+.4f}, ez={pos_error[2]:+.4f}"
+        #         )
 
-                    self.errors[self.curr_wp] = self.hold_max_error
-                    self.get_logger().info(
-                        f"Waypoint {self.curr_wp + 1} held successfully for 2 seconds. "
-                        f"Max hold error = {self.hold_max_error:.5f} m ({self.hold_max_error * 1000.0:.1f} mm)"
-                    )
+        #     if error < waypoint_tolerance:
+        #         self.get_logger().info(f"Waypoint {self.curr_wp + 1} reached.")
+        #         # Keep explicitly commanding zero velocity while holding
+        #         self.publish_twist(
+        #             self.zero_vel_lin,
+        #             self.zero_vel_ang
+        #         )
 
-                    self.curr_wp += 1
-                    self.hold_start = None
-                    self.hold_max_error = None
-                    self.reset_pid()
+        #         # Start hold timer when waypoint is first reached
+        #         if self.hold_start is None:
+        #             self.hold_start = self.get_clock().now()
+        #             self.hold_max_error = error
+        #             self.reset_pid()
+
+        #             self.get_logger().info(
+        #                 f"Waypoint {self.curr_wp + 1} reached at {error * 1000.0:.1f} mm error. Starting 2 second hold..."
+        #             )
+
+        #             return
+
+        #         # Calculate how long we have been holding
+        #         elapsed = (
+        #             self.get_clock().now() - self.hold_start
+        #         ).nanoseconds / 1e9
+
+        #         self.hold_max_error = max(self.hold_max_error, error)
+
+        #         if self.debug_counter % 10 == 0:
+        #             self.get_logger().info(
+        #                 f"Holding WP {self.curr_wp + 1}: {elapsed:.2f} s | "
+        #                 f"current error={error * 1000.0:.1f} mm | "
+        #                 f"max hold error={self.hold_max_error * 1000.0:.1f} mm"
+        #             )
+
+        #         # Hold complete
+        #         if elapsed >= self.hold_duration:
+
+        #             self.errors[self.curr_wp] = self.hold_max_error
+        #             self.get_logger().info(
+        #                 f"Waypoint {self.curr_wp + 1} held successfully for 2 seconds. "
+        #                 f"Max hold error = {self.hold_max_error:.5f} m ({self.hold_max_error * 1000.0:.1f} mm)"
+        #             )
+
+        #             self.curr_wp += 1
+        #             self.hold_start = None
+        #             self.hold_max_error = None
+        #             self.reset_pid()
                     
-                return
-            else:
-                # If the tool left the tolerance region before completing the hold,
-                # restart the hold next time it enters.
-                if self.hold_start is not None:
-                    self.get_logger().info(
-                        f"WP {self.curr_wp + 1} left tolerance at {error * 1000.0:.1f} mm; restarting hold timer."
-                    )
-                    self.reset_pid()
-                self.hold_start = None
-                self.hold_max_error = None
+        #         return
+        #     else:
+        #         # If the tool left the tolerance region before completing the hold,
+        #         # restart the hold next time it enters.
+        #         if self.hold_start is not None:
+        #             self.get_logger().info(
+        #                 f"WP {self.curr_wp + 1} left tolerance at {error * 1000.0:.1f} mm; restarting hold timer."
+        #             )
+        #             self.reset_pid()
+        #         self.hold_start = None
+        #         self.hold_max_error = None
 
-                # --- Cartesian PID: XYZ position error -> XYZ TCP linear velocity ---
-                now = self.get_clock().now()
-                if self.pid_prev_time is None or self.pid_prev_error is None:
-                    dt = self.control_rate
-                    derivative = [0.0, 0.0, 0.0]
-                else:
-                    dt = (now - self.pid_prev_time).nanoseconds / 1e9
-                    # Protect against zero/negative dt or a simulation time jump/reset.
-                    if dt <= 1e-6 or dt > 0.5:
-                        dt = self.control_rate
-                        derivative = [0.0, 0.0, 0.0]
-                    else:
-                        derivative = [
-                            (pos_error[i] - self.pid_prev_error[i]) / dt
-                            for i in range(3)
-                        ]
+        #         # --- Cartesian PID: XYZ position error -> XYZ TCP linear velocity ---
+        #         now = self.get_clock().now()
+        #         if self.pid_prev_time is None or self.pid_prev_error is None:
+        #             dt = self.control_rate
+        #             derivative = [0.0, 0.0, 0.0]
+        #         else:
+        #             dt = (now - self.pid_prev_time).nanoseconds / 1e9
+        #             # Protect against zero/negative dt or a simulation time jump/reset.
+        #             if dt <= 1e-6 or dt > 0.5:
+        #                 dt = self.control_rate
+        #                 derivative = [0.0, 0.0, 0.0]
+        #             else:
+        #                 derivative = [
+        #                     (pos_error[i] - self.pid_prev_error[i]) / dt
+        #                     for i in range(3)
+        #                 ]
 
-                for i in range(3):
-                    self.pid_integral[i] += pos_error[i] * dt
-                    self.pid_integral[i] = max(
-                        -self.integral_limit,
-                        min(self.pid_integral[i], self.integral_limit)
-                    )
+        #         for i in range(3):
+        #             self.pid_integral[i] += pos_error[i] * dt
+        #             self.pid_integral[i] = max(
+        #                 -self.integral_limit,
+        #                 min(self.pid_integral[i], self.integral_limit)
+        #             )
 
-                p_term = [self.Kp * e for e in pos_error]
-                i_term = [self.Ki * e for e in self.pid_integral]
-                d_term = [self.Kd * e for e in derivative]
+        #         p_term = [self.Kp * e for e in pos_error]
+        #         i_term = [self.Ki * e for e in self.pid_integral]
+        #         d_term = [self.Kd * e for e in derivative]
 
-                linear_velocity = [
-                    p_term[i] + i_term[i] + d_term[i]
-                    for i in range(3)
-                ]
+        #         linear_velocity = [
+        #             p_term[i] + i_term[i] + d_term[i]
+        #             for i in range(3)
+        #         ]
 
-                self.pid_prev_error = pos_error.copy()
-                self.pid_prev_time = now
+        #         self.pid_prev_error = pos_error.copy()
+        #         self.pid_prev_time = now
 
-                # Cap the magnitude of the WHOLE Cartesian velocity vector.
-                speed = math.sqrt(sum(v * v for v in linear_velocity))
-                safe_cap = 0.99 * cap_linear_mps
-                if speed > safe_cap and speed > 0.0:
-                    scale = safe_cap / speed
-                    linear_velocity = [v * scale for v in linear_velocity]
-                    speed = safe_cap
+        #         # Cap the magnitude of the WHOLE Cartesian velocity vector.
+        #         speed = math.sqrt(sum(v * v for v in linear_velocity))
+        #         safe_cap = 0.99 * cap_linear_mps
+        #         if speed > safe_cap and speed > 0.0:
+        #             scale = safe_cap / speed
+        #             linear_velocity = [v * scale for v in linear_velocity]
+        #             speed = safe_cap
 
-                angular_velocity = [0.0, 0.0, 0.0]
-                self.publish_twist(linear_velocity, angular_velocity)
+        #         angular_velocity = [0.0, 0.0, 0.0]
+        #         self.publish_twist(linear_velocity, angular_velocity)
 
-                if self.debug_counter % 10 == 0:
-                    self.get_logger().info(
-                        f"PID gains Kp={self.Kp:.3f}, Ki={self.Ki:.3f}, Kd={self.Kd:.3f} | "
-                        f"cmd_speed={speed:.4f} m/s | cmd={['%.4f' % v for v in linear_velocity]}"
-                    )
+        #         if self.debug_counter % 10 == 0:
+        #             self.get_logger().info(
+        #                 f"PID gains Kp={self.Kp:.3f}, Ki={self.Ki:.3f}, Kd={self.Kd:.3f} | "
+        #                 f"cmd_speed={speed:.4f} m/s | cmd={['%.4f' % v for v in linear_velocity]}"
+        #             )
 
 
 ##################### FUNCTION DEFINITION #######################
