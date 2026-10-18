@@ -41,6 +41,7 @@ from sensor_msgs.msg import JointState
 from std_msgs.msg import Int32
 import re # needed to parse ore data from tf buffer and assign numbers to each ore type
 import yaml # Convert the data from tf buffer into yaml format to parse using re
+import tf2_ros # To convert camera ore position to base_link ore position
 
 
 ##################### TASK CONSTANTS #######################
@@ -167,6 +168,10 @@ class arm_waypoints(Node):
         self.integral_limit = 0.5  # <-- ADDED TO FIX UNDEFINED VARIABLE
         self.joint_kp = 2.0
         self.wp_tol = 0.03
+
+        # Transforms
+        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
         # State machine
         #* Valid states = ['HOME', 'SWITCH_TO_TWIST', 'WAIT_FOR_ORE', 'MOVE_ABOVE_ORE', 'DESCEND_TO_ORE', 'MAGNET_ON', 'LIFT_ORE', 'VERIFY_PICK', 'MOVE_ABOVE_DROP', 'DESCEND_TO_DROP', 'MAGNET_OFF', 'RETREAT', 'NEXT_ORE', 'RECOVER_STOP', 'DONE']
@@ -299,6 +304,67 @@ class arm_waypoints(Node):
 
         self.switch_future = self.switch_cli.call_async(req) # Calls service asynchronously to keep the thread from hanging
 
+    def get_tf_position(self, frame_name):
+        """
+        Returns frame position relative to base_link.
+
+        Example:
+        get_tf_position("azurite_ore_1")
+        -> [x, y, z]
+
+        Returns None if TF isn't available yet.
+        """
+
+        try:
+            transform = self.tf_buffer.lookup_transform(
+                'base_link',          # target frame
+                frame_name,           # frame we want position of
+                rclpy.time.Time()     # latest available TF
+            )
+
+            return [
+                transform.transform.translation.x,
+                transform.transform.translation.y,
+                transform.transform.translation.z
+            ]
+
+        except Exception:
+            return None
+
+
+    def get_available_ore_frames(self):
+        """
+        Find all ore frames currently present in the TF tree.
+
+        Example output:
+        [
+            'azurite_ore_1',
+            'azurite_ore_2',
+            'malachite_ore_1',
+            'vanadinite_ore_1'
+        ]
+        """
+
+        # Get all frames currently known by this node's TF buffer
+        frames_yaml = self.tf_buffer.all_frames_as_yaml()
+        frames = yaml.safe_load(frames_yaml) or {}
+
+        # Match:
+        # azurite_ore_<number>
+        # malachite_ore_<number>
+        # vanadinite_ore_<number>
+        ore_pattern = re.compile(
+            r'^(azurite|malachite|vanadinite)_ore_\d+$'
+        )
+
+        ore_frames = [
+            frame_name
+            for frame_name in frames.keys()
+            if ore_pattern.match(frame_name)
+        ]
+
+        return sorted(ore_frames)
+
 
     def process_waypoints(self):
         '''
@@ -363,7 +429,32 @@ class arm_waypoints(Node):
             self.state = "WAIT_FOR_ORE"
 
         elif self.state == "WAIT_FOR_ORE":
-            self.get_logger().info(f"in {self.state}")
+            # self.get_logger().info(f"in {self.state}")
+            self.publish_twist(self.zero_vel_lin, self.zero_vel_ang) # Publish 0 till ore received.
+            ore_frames = self.get_available_ore_frames()
+
+            for ore_name in ore_frames:
+                if ore_name in self.processed_ores: # Pass if already processed
+                    continue
+                ore_position = self.get_tf_position(ore_name) # Gives position of ore from base
+                if ore_position is None:
+                    continue #TODO change this later to avoid missing ores or smthig
+
+                self.current_ore = ore_name
+                self.current_ore_position = ore_position
+
+                self.get_logger().info(
+                    f"Selected {ore_name} at "
+                    f"{[round(x, 3) for x in ore_position]}"
+                )
+
+                self.state = "MOVE_ABOVE_ORE"
+                return 
+
+        # elif self.state == "MOVE_ABOVE_ORE":
+        #     self.get_logger().info(f"in {self.state}")
+
+
 
 
 
