@@ -42,6 +42,8 @@ from std_msgs.msg import Int32
 import re # needed to parse ore data from tf buffer and assign numbers to each ore type
 import yaml # Convert the data from tf buffer into yaml format to parse using re
 import tf2_ros # To convert camera ore position to base_link ore position
+from std_srvs.srv import SetBool # Used to set True/False thru service
+from std_msgs.msg import Int32, Float32 # Store
 
 
 ##################### TASK CONSTANTS #######################
@@ -116,12 +118,14 @@ class arm_waypoints(Node):
         self.tcp_sub = self.create_subscription(PoseStamped, '/tcp_pose_raw', self.tcpposecb, 20)
         self.joint_sub = self.create_subscription(JointState, '/joint_states', self.jointstatecb, 50)
         self.status_sub = self.create_subscription(Int32, '/arm_status', self.armstatuscb, 10)
+        self.force_sub = self.create_subscription(Float32, '/ur7e/end_effector/force_magnitude', self.forcecb, 10)
 
         ############ Constructor VARIABLES/OBJECTS ############
 
         self.control_rate = 0.05                                                        # rate of time to run one control cycle (seconds)
         self.switch_cli = self.create_client(                                           # client used to pick which command topic is live
             SwitchController, f'{servo_ns}/switch_controller')
+        self.magnet_cli = self.create_client(SetBool, '/magnet')
         self.timer = self.create_timer(self.control_rate, self.process_waypoints)       # creating a timer based function which gets called every 0.05 seconds
 
         self.tcp_pose = None                                                            # tool pose variable (from tcpposecb())
@@ -167,19 +171,26 @@ class arm_waypoints(Node):
         self.Kd = 0.5
         self.integral_limit = 0.5  # <-- ADDED TO FIX UNDEFINED VARIABLE
         self.joint_kp = 2.0
-        self.wp_tol = 0.03
+        self.pose_tol = 0.03
 
         # Transforms
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
         # State machine
-        #* Valid states = ['HOME', 'SWITCH_TO_TWIST', 'WAIT_FOR_ORE', 'MOVE_ABOVE_ORE', 'DESCEND_TO_ORE', 'MAGNET_ON', 'LIFT_ORE', 'VERIFY_PICK', 'MOVE_ABOVE_DROP', 'DESCEND_TO_DROP', 'MAGNET_OFF', 'RETREAT', 'NEXT_ORE', 'RECOVER_STOP', 'DONE']
+        #* Valid states = ['HOME', 'SWITCH_TO_TWIST', 'WAIT_FOR_ORE', 'MOVE_ABOVE_ORE', 'MAGNET_ON', 'DESCEND_TO_ORE', 'LIFT_ORE', 'VERIFY_PICK', 'MOVE_ABOVE_DROP', 'DESCEND_TO_DROP', 'MAGNET_OFF', 'RETREAT', 'NEXT_ORE', 'RECOVER_STOP', 'DONE']
         self.state = 'HOME' # Start the node by moving arm to HOME position. 
 
         self.current_ore = None
         self.current_ore_position = None # Lock this once ore transform is done to make sure arm moving doesn't mean the position of ore isnt readjusted
         self.processed_ores = set()
+
+        # Magnet stuff
+        self.force_mag = None
+        self.magnet_future = None
+        self.magnet_state = False
+        self.hover_z = None
+
 
         ############################################
     
@@ -271,6 +282,18 @@ class arm_waypoints(Node):
         '''
 
         self.arm_status = data.data
+
+    def forcecb(self, data):
+        '''
+        Description:    Callback function for the magnet force topic.
+                        Use this function to receive the force acting on the magnet tool.
+
+        Args:
+            data (Float32):    Force in Newtons acting on the magnet
+
+        Returns:
+        '''
+        self.force_mag = data.data
 
 
     def switch_controller(self, controller):
@@ -365,7 +388,90 @@ class arm_waypoints(Node):
 
         return sorted(ore_frames)
 
+    def move_to_point(self, point, max_speed=cap_linear_mps, tol=None):
+        if tol is None:
+            tol = self.pose_tol
 
+        curr_pose = self.tcp_pose.position
+        target_pose = point
+
+        # Cartesian position error in base_link
+        pos_error = [
+            target_pose[0] - curr_pose.x,
+            target_pose[1] - curr_pose.y,
+            target_pose[2] - curr_pose.z,
+        ]
+        error = math.sqrt(sum(e * e for e in pos_error))
+
+        if error < tol:
+            self.get_logger().info(f"Target {[round(x, 3) for x in target_pose]} reached (err={error*1000:.1f} mm).")
+            self.publish_twist(self.zero_vel_lin, self.zero_vel_ang)
+            self.reset_pid()  # <-- Crucial so next state starts with clean derivative/integral
+            return True
+
+        # --- Cartesian PID: XYZ position error -> XYZ TCP linear velocity ---
+        now = self.get_clock().now()
+        if self.pid_prev_time is None or self.pid_prev_error is None:
+            dt = self.control_rate
+            derivative = [0.0, 0.0, 0.0]
+        else:
+            dt = (now - self.pid_prev_time).nanoseconds / 1e9
+            if dt <= 1e-6 or dt > 0.5:
+                dt = self.control_rate
+                derivative = [0.0, 0.0, 0.0]
+            else:
+                derivative = [
+                    (pos_error[i] - self.pid_prev_error[i]) / dt
+                    for i in range(3)
+                ]
+
+        for i in range(3):
+            self.pid_integral[i] += pos_error[i] * dt
+            self.pid_integral[i] = max(
+                -self.integral_limit,
+                min(self.pid_integral[i], self.integral_limit)
+            )
+
+        p_term = [self.Kp * e for e in pos_error]
+        i_term = [self.Ki * e for e in self.pid_integral]
+        d_term = [self.Kd * e for e in derivative]
+
+        linear_velocity = [
+            p_term[i] + i_term[i] + d_term[i]
+            for i in range(3)
+        ]
+
+        self.pid_prev_error = pos_error.copy()
+        self.pid_prev_time = now
+
+        # Cap the magnitude of the WHOLE Cartesian velocity vector
+        speed = math.sqrt(sum(v * v for v in linear_velocity))
+        safe_cap = min(0.99 * cap_linear_mps, max_speed)
+        if speed > safe_cap and speed > 0.0:
+            scale = safe_cap / speed
+            linear_velocity = [v * scale for v in linear_velocity]
+            speed = safe_cap
+
+        self.publish_twist(linear_velocity, self.zero_vel_ang)
+
+        self.debug_counter += 1
+        if self.debug_counter % 10 == 0:
+            self.get_logger().info(
+                f"err={error*1000:.1f}mm | cmd_speed={speed:.4f} m/s | cmd={['%.3f' % v for v in linear_velocity]}"
+            )
+        return False
+
+
+    def set_magnet(self, state: bool):
+        if not self.magnet_cli.service_is_ready():
+            self.get_logger().warn("Magnet service not ready...")
+            return False
+        self.magnet_state = state
+        req = SetBool.Request()
+        req.data = self.magnet_state
+        self.magnet_future = self.magnet_cli.call_async(request=req)
+        return True
+    
     def process_waypoints(self):
         '''
         Description:    Timer function used to drive the tool through the waypoints.
@@ -429,30 +535,87 @@ class arm_waypoints(Node):
             self.state = "WAIT_FOR_ORE"
 
         elif self.state == "WAIT_FOR_ORE":
-            # self.get_logger().info(f"in {self.state}")
-            self.publish_twist(self.zero_vel_lin, self.zero_vel_ang) # Publish 0 till ore received.
+            self.publish_twist(self.zero_vel_lin, self.zero_vel_ang)
             ore_frames = self.get_available_ore_frames()
 
             for ore_name in ore_frames:
-                if ore_name in self.processed_ores: # Pass if already processed
+                if ore_name in self.processed_ores:
                     continue
-                ore_position = self.get_tf_position(ore_name) # Gives position of ore from base
+                ore_position = self.get_tf_position(ore_name)
                 if ore_position is None:
-                    continue #TODO change this later to avoid missing ores or smthig
+                    continue
 
                 self.current_ore = ore_name
                 self.current_ore_position = ore_position
+                # Keep current Z height so MOVE_ABOVE_ORE only moves horizontally in X and Y
+                self.hover_z = self.tcp_pose.position.z
 
                 self.get_logger().info(
-                    f"Selected {ore_name} at "
-                    f"{[round(x, 3) for x in ore_position]}"
+                    f"Selected {ore_name} at {[round(x, 3) for x in ore_position]} | Hover Z={self.hover_z:.3f}"
                 )
-
+                self.reset_pid()
                 self.state = "MOVE_ABOVE_ORE"
-                return 
+                return
 
-        # elif self.state == "MOVE_ABOVE_ORE":
-        #     self.get_logger().info(f"in {self.state}")
+        elif self.state == "MOVE_ABOVE_ORE":
+            # Target has ore's X and Y, but keeps TCP's hover_z
+            above_target = [
+                self.current_ore_position[0],
+                self.current_ore_position[1],
+                self.hover_z
+            ]
+            if self.move_to_point(above_target) is True:
+                self.get_logger().info(f"Directly above {self.current_ore}! Switching to DESCEND_TO_ORE")
+                self.state = "MAGNET_ON"
+                return
+
+        elif self.state == "MAGNET_ON":
+            if self.magnet_state is not True:
+                self.set_magnet(state=True) # The function itself updates the self.magnet_state var
+            # Handle magnet state setting to True or False
+            if self.magnet_future is not None:
+                self.publish_twist(self.zero_vel_lin, self.zero_vel_ang)
+                self.get_logger().warn(f"Magnet Future not done yet...")
+                if not self.magnet_future.done():
+                    return
+                res = self.magnet_future.result()
+                self.magnet_future = None
+                if res is not None:
+                    self.get_logger().info(f"Switched Magnet state to {self.magnet_state}")
+                else:
+                    self.get_logger().error(f"Switch in magnet state failed. Active state is {self.magnet_state}")
+            else:
+                self.state = "DESCEND_TO_ORE"
+
+        elif self.state == "DESCEND_TO_ORE": #TODO The TCP angle seems to change slightly, will have to check if thats an issue
+            # Target now uses the ore's Z coordinate (with slow approach speed so it doesn't crash)
+            descend_target = [
+                self.current_ore_position[0],
+                self.current_ore_position[1],
+                self.current_ore_position[2]
+            ]
+            if self.move_to_point(descend_target, max_speed=0.25, tol=0.015) is True:
+                self.get_logger().info(f"Reached {self.current_ore} top face!")
+                self.state = "LIFT_ORE"
+                return
+
+        elif self.state == "LIFT_ORE":
+            if self.force_mag < 1.4:
+                self.get_logger().warn(f"Force on magnet is {self.force_mag}, Object not picked")
+                return 
+            ascend_target = [
+                            self.current_ore_position[0],
+                            self.current_ore_position[1],
+                            self.hover_z
+                        ]
+            if self.move_to_point(ascend_target, max_speed=0.25, tol=0.015) is True:
+                self.get_logger().info(f"{self.force_mag}")
+                self.state = "VERIFY_PICKUP"
+
+        
+
+
+
 
 
 
@@ -486,32 +649,32 @@ class arm_waypoints(Node):
         #             self.get_logger().info(f"Max error during each successful 2 s hold -> {summary}")
         #             self.summary_logged = True
         #         return
-        #     # get current pose
-        #     curr_pose = self.tcp_pose.position
-        #     target_pose = waypoints[self.curr_wp]
-        #     # Cartesian position error in base_link
-        #     pos_error = [
-        #         target_pose[0] - curr_pose.x,
-        #         target_pose[1] - curr_pose.y,
-        #         target_pose[2] - curr_pose.z,
-        #     ]
-        #     error = math.sqrt(sum(e * e for e in pos_error))
-        #     waypoint_tolerance = self.wp_tol
+            # # get current pose
+            # curr_pose = self.tcp_pose.position
+            # target_pose = waypoints[self.curr_wp]
+            # # Cartesian position error in base_link
+            # pos_error = [
+            #     target_pose[0] - curr_pose.x,
+            #     target_pose[1] - curr_pose.y,
+            #     target_pose[2] - curr_pose.z,
+            # ]
+            # error = math.sqrt(sum(e * e for e in pos_error))
+            # waypoint_tolerance = self.wp_tol
 
-        #     self.debug_counter += 1
-        #     if self.debug_counter % 10 == 0:  # ~2 Hz at a 20 Hz control loop
-        #         self.get_logger().info(
-        #             f"WP {self.curr_wp + 1} error: {error:.5f} m ({error * 1000.0:.1f} mm) | "
-        #             f"ex={pos_error[0]:+.4f}, ey={pos_error[1]:+.4f}, ez={pos_error[2]:+.4f}"
-        #         )
+            # self.debug_counter += 1
+            # if self.debug_counter % 10 == 0:  # ~2 Hz at a 20 Hz control loop
+            #     self.get_logger().info(
+            #         f"WP {self.curr_wp + 1} error: {error:.5f} m ({error * 1000.0:.1f} mm) | "
+            #         f"ex={pos_error[0]:+.4f}, ey={pos_error[1]:+.4f}, ez={pos_error[2]:+.4f}"
+            #     )
 
-        #     if error < waypoint_tolerance:
-        #         self.get_logger().info(f"Waypoint {self.curr_wp + 1} reached.")
-        #         # Keep explicitly commanding zero velocity while holding
-        #         self.publish_twist(
-        #             self.zero_vel_lin,
-        #             self.zero_vel_ang
-        #         )
+            # if error < waypoint_tolerance:
+            #     self.get_logger().info(f"Waypoint {self.curr_wp + 1} reached.")
+            #     # Keep explicitly commanding zero velocity while holding
+            #     self.publish_twist(
+            #         self.zero_vel_lin,
+            #         self.zero_vel_ang
+            #     )
 
         #         # Start hold timer when waypoint is first reached
         #         if self.hold_start is None:
